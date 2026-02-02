@@ -20,8 +20,10 @@ func main() {
 	}
 	log.Println("✅ Database connected")
 
+	// =========================================================
+	// 🔐 AUTHORIZATION ENDPOINT (DAY 2 — LOCKED)
+	// =========================================================
 	r.POST("/authorize", func(c *gin.Context) {
-		// 2️⃣ Parse request body
 		var req struct {
 			APIKey   string `json:"api_key"`
 			Resource string `json:"resource"`
@@ -30,43 +32,138 @@ func main() {
 
 		if err := c.ShouldBindJSON(&req); err != nil {
 			log.Println("Invalid request body:", err)
-			c.JSON(400, gin.H{"error": "invalid request"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 			return
 		}
-		log.Printf("Received request → api_key: %s, resource: %s, action: %s\n", req.APIKey, req.Resource, req.Action)
 
-		// 3️⃣ Hash API key
+		log.Printf(
+			"Received request → api_key: %s, resource: %s, action: %s\n",
+			req.APIKey, req.Resource, req.Action,
+		)
+
+		// Hash API key
 		hashedKey := auth.HashAPIKey(req.APIKey)
 		log.Println("Hashed API key:", hashedKey)
 
-		// 4️⃣ Lookup project ID from API key
+		// Lookup project
 		projectID, err := auth.GetProjectIDFromAPIKey(hashedKey)
 		if err != nil {
 			log.Println("API key not found or inactive:", err)
 			c.JSON(http.StatusForbidden, gin.H{"allowed": false})
 			return
 		}
-		log.Println("Project ID found:", projectID)
 
-		// 5️⃣ Check policy (zero-trust)
+		// Policy evaluation (zero trust)
 		allowed, err := policy.IsAllowed(projectID, req.Resource, req.Action)
 		if err != nil {
 			log.Println("Policy check error:", err)
 		}
-		log.Println("Policy check result → allowed:", allowed)
 
-		// 6️⃣ Audit log
+		// Audit log (always)
 		result := "deny"
 		if allowed {
 			result = "allow"
 		}
 		audit.Log(projectID, req.Resource, req.Action, c.ClientIP(), result)
-		log.Println("Audit logged:", projectID, req.Resource, req.Action, result)
 
-		// 7️⃣ Respond
 		c.JSON(http.StatusOK, gin.H{"allowed": allowed})
-		log.Println("Response sent → allowed:", allowed)
 	})
 
+	// =========================================================
+	// 🟢 DAY 3 — API KEY LIFECYCLE
+	// =========================================================
+
+	// 🔑 Create API key (shown ONCE)
+	r.POST("/projects/:id/keys", func(c *gin.Context) {
+		projectID := c.Param("id")
+
+		rawKey, err := auth.GenerateAPIKey()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate key"})
+			return
+		}
+
+		hashed := auth.HashAPIKey(rawKey)
+
+		_, err = db.Pool.Exec(
+			c.Request.Context(),
+			`INSERT INTO api_keys (project_id, key_hash, is_active)
+			 VALUES ($1, $2, true)`,
+			projectID, hashed,
+		)
+		if err != nil {
+			log.Println("Failed to store API key:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store key"})
+			return
+		}
+
+		// 🔐 Return raw key ONCE
+		c.JSON(http.StatusCreated, gin.H{
+			"api_key": rawKey,
+		})
+	})
+
+	// 🔁 Rotate API key
+	r.POST("/keys/:id/rotate", func(c *gin.Context) {
+		keyID := c.Param("id")
+
+		// Deactivate old key
+		_, err := db.Pool.Exec(
+			c.Request.Context(),
+			`UPDATE api_keys SET is_active=false WHERE id=$1`,
+			keyID,
+		)
+		if err != nil {
+			log.Println("Failed to revoke old key:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke key"})
+			return
+		}
+
+		// Generate new key
+		rawKey, err := auth.GenerateAPIKey()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate key"})
+			return
+		}
+		hashed := auth.HashAPIKey(rawKey)
+
+		_, err = db.Pool.Exec(
+			c.Request.Context(),
+			`INSERT INTO api_keys (project_id, key_hash, is_active)
+			 SELECT project_id, $1, true FROM api_keys WHERE id=$2`,
+			hashed, keyID,
+		)
+		if err != nil {
+			log.Println("Rotation failed:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "rotation failed"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"api_key": rawKey, // shown once
+		})
+	})
+
+	// 🚫 Revoke API key
+	r.POST("/keys/:id/revoke", func(c *gin.Context) {
+		keyID := c.Param("id")
+
+		_, err := db.Pool.Exec(
+			c.Request.Context(),
+			`UPDATE api_keys SET is_active=false WHERE id=$1`,
+			keyID,
+		)
+		if err != nil {
+			log.Println("Failed to revoke key:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke key"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+	})
+
+	// =========================================================
+
+	log.Println("🚀 SecureAPI running on :8080")
 	r.Run(":8080")
 }
