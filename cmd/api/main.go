@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/reecevinto/secureapi/internal/auth"
 	"github.com/reecevinto/secureapi/internal/db"
@@ -21,31 +22,34 @@ func main() {
 	log.Println("✅ Database connected")
 
 	// =========================================================
-	// 🔐 DAY 6 — AUTHORIZE ENDPOINT USING MIDDLEWARE
+	// 🔐 DAY 7 — AUTHORIZE ENDPOINT USING MIDDLEWARE + RATE LIMITING
 	// =========================================================
-	r.POST("/authorize", func(c *gin.Context) {
-		var req struct {
-			APIKey   string `json:"api_key"`
-			Resource string `json:"resource"`
-			Action   string `json:"action"`
-		}
+	r.POST("/authorize",
+		middleware.APIKeyAuth(),                  // Validate API Key
+		middleware.RateLimiter(100, time.Minute), // 🔹 DAY 7 Rate limiting middleware
+		func(c *gin.Context) {
+			var req struct {
+				Resource string `json:"resource"`
+				Action   string `json:"action"`
+			}
 
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
-			return
-		}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+				return
+			}
 
-		// Use PolicyEnforcer middleware inline
-		middleware.PolicyEnforcer(req.Resource, req.Action)(c)
+			// Use PolicyEnforcer middleware inline
+			middleware.PolicyEnforcer(req.Resource, req.Action)(c)
 
-		// Middleware may abort on deny or invalid key
-		if c.IsAborted() {
-			return
-		}
+			// Middleware may abort on deny or invalid key
+			if c.IsAborted() {
+				return
+			}
 
-		// Success → allowed
-		c.JSON(http.StatusOK, gin.H{"allowed": true})
-	})
+			// Success → allowed
+			c.JSON(http.StatusOK, gin.H{"allowed": true})
+		},
+	)
 
 	// =========================================================
 	// 🟢 DAY 3 — API KEY LIFECYCLE
