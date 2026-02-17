@@ -38,6 +38,24 @@ func main() {
 				return
 			}
 
+			scopesInterface, _ := c.Get("scopes")
+			scopes := scopesInterface.([]string)
+
+			requiredScope := req.Resource + ":" + req.Action
+
+			allowedByScope := false
+			for _, s := range scopes {
+				if s == requiredScope {
+					allowedByScope = true
+					break
+				}
+			}
+
+			if !allowedByScope {
+				c.JSON(http.StatusForbidden, gin.H{"error": "scope violation"})
+				return
+			}
+
 			// Use PolicyEnforcer middleware inline
 			middleware.PolicyEnforcer(req.Resource, req.Action)(c)
 
@@ -58,17 +76,35 @@ func main() {
 		ctx := c.Request.Context()
 		projectID := c.Param("project_id")
 
+		var req struct {
+			ExpiresInHours int      `json:"expires_in_hours"`
+			Scopes         []string `json:"scopes"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+			return
+		}
+
 		rawKey, err := auth.GenerateAPIKey()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate key"})
 			return
 		}
 
-		hashed := auth.HashAPIKey(rawKey)
-		_, err = db.Pool.Exec(ctx, `INSERT INTO api_keys (project_id, key_hash, is_active) VALUES ($1,$2,true)`,
-			projectID, hashed)
+		// 🔥 DAY 8 CHANGE: Remove Go hashing. Postgres will hash using crypt()
+		var expiresAt *time.Time
+		if req.ExpiresInHours > 0 {
+			t := time.Now().Add(time.Duration(req.ExpiresInHours) * time.Hour)
+			expiresAt = &t
+		}
+
+		_, err = db.Pool.Exec(ctx, `
+			INSERT INTO api_keys (project_id, key_hash, is_active, expires_at, scopes)
+			VALUES ($1, crypt($2, gen_salt('bf')), true, $3, $4)
+		`, projectID, rawKey, expiresAt, req.Scopes)
+
 		if err != nil {
-			log.Println("Failed to store API key:", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store key"})
 			return
 		}
@@ -92,11 +128,13 @@ func main() {
 			return
 		}
 
-		hashed := auth.HashAPIKey(rawKey)
+		// 🔥 DAY 8 CHANGE: Use crypt() here too
 		_, err = db.Pool.Exec(ctx,
-			`INSERT INTO api_keys (project_id, key_hash, is_active) 
-			 SELECT project_id, $1, true FROM api_keys WHERE id=$2`,
-			hashed, keyID)
+			`INSERT INTO api_keys (project_id, key_hash, is_active)
+			 SELECT project_id, crypt($1, gen_salt('bf')), true
+			 FROM api_keys WHERE id=$2`,
+			rawKey, keyID)
+
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "rotation failed"})
 			return
